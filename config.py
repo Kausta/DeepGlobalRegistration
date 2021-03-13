@@ -66,6 +66,8 @@ trainer_arg.add_argument('--clip_weight_thresh', type=float,
                          default=0.05, help='Weight threshold for detecting inliers')
 trainer_arg.add_argument('--best_val_metric', type=str, default='succ_rate')
 
+trainer_arg.add_argument('--overfit', type=str2bool, default=False)
+
 # Inlier detection trainer
 inlier_arg = add_argument_group('Inlier')
 inlier_arg.add_argument('--inlier_model', type=str, default='ResUNetBN2C')

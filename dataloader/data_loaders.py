@@ -31,7 +31,8 @@ def make_data_loader(config, phase, batch_size, num_workers=0, shuffle=None):
   if phase in ['train', 'trainval']:
     use_random_rotation = config.use_random_rotation
     use_random_scale = config.use_random_scale
-    transforms += [t.Jitter()]
+    if not config.overfit:
+      transforms += [t.Jitter()]
 
   if phase in ['val', 'test']:
     use_random_rotation = config.test_random_rotation

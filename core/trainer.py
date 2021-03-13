@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 
 from model import load_model
+from model.common import disable_batchnorm
 from core.knn import find_knn_batch
 from core.correspondence import find_correct_correspondence
 from core.loss import UnbalancedLoss, BalancedLoss
@@ -48,6 +49,7 @@ class WeightedProcrustesTrainer:
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     self.config = config
+    self.overfit = config.overfit
 
     # Training config
     self.max_epoch = config.max_epoch
@@ -102,11 +104,19 @@ class WeightedProcrustesTrainer:
     else:
       self.crit = UnbalancedLoss()
 
-    self.optimizer = getattr(optim, config.optimizer)(self.inlier_model.parameters(),
-                                                      lr=config.lr,
-                                                      momentum=config.momentum,
-                                                      weight_decay=config.weight_decay)
-    self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, config.exp_gamma)
+    if self.overfit:
+      self.optimizer = optim.SGD(self.inlier_model.parameters(),
+                                 lr=config.lr,
+                                 momentum=0,
+                                 weight_decay=0)
+      self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=1)
+      print("Overfitting with lr=0.1 SGD, no regularization")
+    else:
+      self.optimizer = getattr(optim, config.optimizer)(self.inlier_model.parameters(),
+                                                        lr=config.lr,
+                                                        momentum=config.momentum,
+                                                        weight_decay=config.weight_decay)
+      self.scheduler = optim.lr_scheduler.ExponentialLR(self.optimizer, config.exp_gamma)
 
     # Output preparation
     ensure_dir(self.checkpoint_dir)
@@ -125,8 +135,9 @@ class WeightedProcrustesTrainer:
     # Baseline random feature performance
     if self.test_valid:
       val_dict = self._valid_epoch()
-      for k, v in val_dict.items():
-        self.writer.add_scalar(f'val/{k}', v, 0)
+      if self.start_epoch <= 1:
+        for k, v in val_dict.items():
+          self.writer.add_scalar(f'val/{k}', v, 0)
 
     # Train and valid
     for epoch in range(self.start_epoch, self.max_epoch + 1):
@@ -160,6 +171,8 @@ class WeightedProcrustesTrainer:
     # Fix the feature model and train the inlier model
     self.feat_model.eval()
     self.inlier_model.train()
+    if self.overfit:
+      disable_batchnorm(self.inlier_model)
 
     # Epoch starts from 1
     total_loss, total_num = 0, 0.0
@@ -169,6 +182,8 @@ class WeightedProcrustesTrainer:
     # Meters for statistics
     average_valid_meter = AverageMeter()
     loss_meter = AverageMeter()
+    inlier_loss_meter = AverageMeter()
+    procrustes_loss_meter = AverageMeter()
     data_meter = AverageMeter()
     regist_succ_meter = AverageMeter()
     regist_rte_meter = AverageMeter()
@@ -185,6 +200,7 @@ class WeightedProcrustesTrainer:
     else:
       num_train_iter = len(data_loader) // iter_size
     start_iter = (epoch - 1) * num_train_iter
+    print("NumTrainIter, StartIter, LenDataLoader, IterSize = ", num_train_iter, start_iter, len(data_loader), iter_size)
 
     tp, fp, tn, fn = 0, 0, 0, 0
 
@@ -193,6 +209,7 @@ class WeightedProcrustesTrainer:
       self.optimizer.zero_grad()
 
       batch_loss, data_time = 0, 0
+      batch_procrustes_loss, batch_inlier_loss = 0, 0
       total_timer.tic()
 
       for iter_idx in range(iter_size):
@@ -253,6 +270,8 @@ class WeightedProcrustesTrainer:
           max_val = loss.item()
           logging.info('Loss is infinite, abort ')
           continue
+        with torch.no_grad():
+          batch_procrustes_loss += loss.mean().item()
 
         # Direct inlier loss against nearest neighbor searched GT
         target = torch.from_numpy(is_correct).squeeze()
@@ -260,7 +279,8 @@ class WeightedProcrustesTrainer:
           inlier_loss = self.config.inlier_direct_loss_weight * self.crit(
               logits.cpu().squeeze(), target.to(torch.float)) / iter_size
           loss += inlier_loss
-
+          with torch.no_grad():
+            batch_inlier_loss += inlier_loss.mean().item()
         loss.backward()
 
         # Update statistics before backprop
@@ -301,6 +321,8 @@ class WeightedProcrustesTrainer:
       total_timer.toc()
       data_meter.update(data_time)
       loss_meter.update(batch_loss)
+      procrustes_loss_meter.update(batch_procrustes_loss)
+      inlier_loss_meter.update(batch_inlier_loss)
 
       # Output to logs
       if curr_iter % self.config.stat_freq == 0:
@@ -315,6 +337,8 @@ class WeightedProcrustesTrainer:
 
         stat = {
             'loss': loss_meter.avg,
+            'procrustes_loss': procrustes_loss_meter.avg,
+            'inlier_loss': inlier_loss_meter.avg,
             'precision': precision,
             'recall': recall,
             'tpr': tpr,
@@ -330,6 +354,8 @@ class WeightedProcrustesTrainer:
         logging.info(' '.join([
             f"Train Epoch: {epoch} [{curr_iter}/{num_train_iter}],",
             f"Current Loss: {loss_meter.avg:.3e},",
+            f"Current Procrustes Loss: {procrustes_loss_meter.avg:.3e},",
+            f"Current Inlier Loss: {inlier_loss_meter.avg:.3e},",
             f"Correspondence acc: {correspondence_accuracy:.3e}",
             f", Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f},",
             f"TPR: {tpr:.4f}, TNR: {tnr:.4f}, BAcc: {balanced_accuracy:.4f}",
@@ -341,6 +367,8 @@ class WeightedProcrustesTrainer:
         ]))
 
         loss_meter.reset()
+        procrustes_loss_meter.reset()
+        inlier_loss_meter.reset()
         regist_rte_meter.reset()
         regist_rre_meter.reset()
         regist_succ_meter.reset()
@@ -505,7 +533,7 @@ class WeightedProcrustesTrainer:
         logging.info("=> loading checkpoint '{}'".format(config.resume))
         state = torch.load(config.resume)
 
-        self.start_epoch = state['epoch']
+        self.start_epoch = state['epoch'] + 1
         self.feat_model.load_state_dict(state['state_dict'])
         self.feat_model = self.feat_model.to(self.device)
         self.scheduler.load_state_dict(state['scheduler'])

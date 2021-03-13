@@ -35,6 +35,7 @@ class IndoorPairDataset(PairDataset):
         )
         self.root = root = config.threed_match_dir
         self.use_xyz_feature = config.use_xyz_feature
+        self.overfit = config.overfit
         logging.info(f"Loading the subset {phase} from {root}")
 
         subset_names = open(self.DATA_FILES[phase]).read().split()
@@ -50,6 +51,8 @@ class IndoorPairDataset(PairDataset):
                 fnames = [x.strip().split() for x in content]
                 for fname in fnames:
                     self.files.append([fname[0], fname[1]])
+                    # Caner Korkmaz
+                    print("Adding data pair", fname[0], fname[1])
 
     def __getitem__(self, idx):
         file0 = os.path.join(self.root, self.files[idx][0])
@@ -60,13 +63,13 @@ class IndoorPairDataset(PairDataset):
         xyz1 = data1["pcd"]
         matching_search_voxel_size = self.matching_search_voxel_size
 
-        if self.random_scale and random.random() < 0.95:
+        if not self.overfit and self.random_scale and random.random() < 0.95:
             scale = self.min_scale + (self.max_scale - self.min_scale) * random.random()
             matching_search_voxel_size *= scale
             xyz0 = scale * xyz0
             xyz1 = scale * xyz1
 
-        if self.random_rotation:
+        if not self.overfit and self.random_rotation:
             T0 = sample_random_trans(xyz0, self.randg, self.rotation_range)
             T1 = sample_random_trans(xyz1, self.randg, self.rotation_range)
             trans = T1 @ np.linalg.inv(T0)
@@ -83,9 +86,10 @@ class IndoorPairDataset(PairDataset):
         sel0 = ME.utils.sparse_quantize(xyz0_th / self.voxel_size, return_index=True)
         sel1 = ME.utils.sparse_quantize(xyz1_th / self.voxel_size, return_index=True)
 
+        # Caner: atleast_2d
         # Make point clouds using voxelized points
-        pcd0 = make_open3d_point_cloud(xyz0[sel0])
-        pcd1 = make_open3d_point_cloud(xyz1[sel1])
+        pcd0 = make_open3d_point_cloud(np.atleast_2d(xyz0[sel0]))
+        pcd1 = make_open3d_point_cloud(np.atleast_2d(xyz1[sel1]))
 
         # Select features and points using the returned voxelized indices
         # 3DMatch color is not helpful
